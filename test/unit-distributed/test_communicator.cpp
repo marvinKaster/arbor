@@ -539,6 +539,68 @@ TEST(communicator, ring)
     EXPECT_TRUE(test_ring(D, C, [](cell_gid_type g){return g%2==1;}));
 }
 
+// Rewire the ring incrementally: the first cell on each rank drops its
+// connection and receives one from the opposite side of the ring instead,
+// usually from another rank. After the commit, spikes must be routed there.
+TEST(communicator, incremental_connections)
+{
+    unsigned N = g_context->distributed->size();
+    unsigned n_local = 10u;
+    unsigned n_global = n_local*N;
+
+    auto R = ring_recipe(n_global);
+    const auto D = partition_load_balance(R, g_context);
+
+    std::vector<cell_gid_type> mc_gids, lif_gids;
+    for (auto g: D->groups()) {
+        auto& gids = g.kind == cell_kind::cable? mc_gids: lif_gids;
+        gids.insert(gids.end(), g.gids.begin(), g.gids.end());
+    }
+    cell_label_range mc_srcs, mc_tgts, lif_srcs, lif_tgts;
+    auto mc_group = cable_cell_group(mc_gids, R, mc_srcs, mc_tgts, make_fvm_lowered_cell(backend_kind::multicore, *g_context));
+    auto lif_group = lif_cell_group(lif_gids, R, lif_srcs, lif_tgts);
+    auto local_sources = cell_labels_and_gids(mc_srcs, mc_gids);
+    auto local_targets = cell_labels_and_gids(mc_tgts, mc_gids);
+    local_sources.append({lif_srcs, lif_gids});
+    local_targets.append({lif_tgts, lif_gids});
+    auto source_map = label_resolution_map(g_context->distributed->gather_cell_labels_and_gids(local_sources));
+    auto target_map = label_resolution_map(local_targets);
+
+    auto C = communicator(R, D, g_context);
+    C.update_connections(R, D, source_map, target_map);
+
+    auto gids = get_gids(D);
+    auto tgt = gids.front();
+    auto old_src = source_of(tgt, n_global);
+    auto new_src = (old_src + n_global/2)%n_global;
+    auto conn = [&](cell_gid_type src) { return cell_connection({src, "src"}, {"tgt"}, float(tgt), 1.0*U::ms); };
+
+    C.remove_connections({{tgt, conn(old_src)}}, D, source_map, target_map);
+    C.add_connections({{tgt, conn(new_src)}}, D, source_map, target_map);
+    EXPECT_TRUE(C.has_uncommitted_connections());
+    C.commit_connections();
+    EXPECT_FALSE(C.has_uncommitted_connections());
+    EXPECT_EQ(n_local, C.connections().size());
+
+    // Every cell fires.
+    std::vector<spike> local_spikes;
+    for (auto gid: gids) local_spikes.push_back(make_spike(gid));
+    auto spikes = C.exchange(local_spikes);
+    std::vector<arb::pse_vector> queues(C.num_local_cells());
+    C.make_event_queues(spikes, queues);
+
+    auto group_map = get_group_map(D);
+    std::size_t num_events = 0;
+    for (const auto& q: queues) num_events += q.size();
+    EXPECT_EQ(n_local, num_events);
+    for (auto gid: gids) {
+        auto src = gid == tgt? new_src: source_of(gid, n_global);
+        spike_event expected{0u, src + 1.0f, float(gid)};
+        const auto& q = queues[group_map[gid]];
+        EXPECT_NE(std::find(q.begin(), q.end(), expected), q.end()) << "missing event on gid " << gid << " from " << src;
+    }
+}
+
 template <typename F>
 ::testing::AssertionResult
 test_all2all(const domain_decomposition_ptr D, communicator& C, F&& f) {

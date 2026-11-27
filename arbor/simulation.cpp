@@ -74,6 +74,14 @@ struct simulation_state {
 
     void update(const recipe& rec);
 
+    template <typename C>
+    void add_connections(const std::vector<std::tuple<cell_gid_type, C>>& conns);
+
+    template <typename C>
+    void remove_connections(const std::vector<std::tuple<cell_gid_type, C>>& conns);
+
+    void commit_connections();
+
     void reset();
 
     time_type run(time_type tfinal, time_type dt);
@@ -104,6 +112,7 @@ struct simulation_state {
     epoch_function epoch_callback_;
     label_resolution_map source_resolution_map_;
     label_resolution_map target_resolution_map_;
+    bool resolve_sources_ = true;
 
 
     // We do not serialize:
@@ -247,7 +256,8 @@ simulation_state::simulation_state(const recipe& rec,
         });
     PL(group);
     PE(sources);
-    if (rec.resolve_sources()) {
+    resolve_sources_ = rec.resolve_sources();
+    if (resolve_sources_) {
         cell_labels_and_gids local_sources;
         for(auto gidx: util::make_span(num_groups)) local_sources.append(std::move(cg_sources[gidx]));
         auto global_sources = ctx->distributed->gather_cell_labels_and_gids(local_sources);
@@ -307,6 +317,40 @@ void simulation_state::update(const recipe& rec) {
     event_lanes_[0].resize(num_local_cells);
     event_lanes_[1].resize(num_local_cells);
     PL(update);
+    PL(arbor);
+}
+
+template <typename C>
+void simulation_state::add_connections(const std::vector<std::tuple<cell_gid_type, C>>& conns) {
+    PE(arbor);
+    if constexpr (std::is_same_v<C, cell_connection>) {
+        if (!resolve_sources_ && !conns.empty()) throw resolution_disabled{std::get<0>(conns.front())};
+        communicator_.add_connections(conns, ddc_, source_resolution_map_, target_resolution_map_);
+    }
+    else {
+        communicator_.add_connections(conns, ddc_, target_resolution_map_);
+    }
+    PL(arbor);
+}
+
+template <typename C>
+void simulation_state::remove_connections(const std::vector<std::tuple<cell_gid_type, C>>& conns) {
+    PE(arbor);
+    if constexpr (std::is_same_v<C, cell_connection>) {
+        if (!resolve_sources_ && !conns.empty()) throw resolution_disabled{std::get<0>(conns.front())};
+        communicator_.remove_connections(conns, ddc_, source_resolution_map_, target_resolution_map_);
+    }
+    else {
+        communicator_.remove_connections(conns, ddc_, target_resolution_map_);
+    }
+    PL(arbor);
+}
+
+void simulation_state::commit_connections() {
+    PE(arbor);
+    communicator_.commit_connections();
+    // As in update: half the minimum delay of the network is the max integration interval.
+    t_interval_ = min_delay()/2;
     PL(arbor);
 }
 
@@ -377,6 +421,9 @@ time_type simulation_state::run(time_type tfinal, time_type dt) {
     PE(arbor);
     PE(run);
 
+    if (communicator_.has_uncommitted_connections()) {
+        throw arbor_exception("simulation: connections were added or removed without calling commit_connections before run");
+    }
     if (!std::isfinite(dt) || dt <= 0) throw std::domain_error("simulation: dt must be finite, positive, and in [ms]");
     if (!std::isfinite(tfinal) || tfinal < 0) throw std::domain_error("simulation: tfinal must be finite, positive, and in [ms]");
     // NOTE It would be preferable to have the cell groups to make smart
@@ -582,6 +629,24 @@ void simulation::reset() {
 }
 
 void simulation::update(const recipe& rec) { impl_->update(rec); }
+
+void simulation::add_connections(const std::vector<std::tuple<cell_gid_type, cell_connection>>& conns) {
+    impl_->add_connections(conns);
+}
+
+void simulation::add_connections(const std::vector<std::tuple<cell_gid_type, raw_cell_connection>>& conns) {
+    impl_->add_connections(conns);
+}
+
+void simulation::remove_connections(const std::vector<std::tuple<cell_gid_type, cell_connection>>& conns) {
+    impl_->remove_connections(conns);
+}
+
+void simulation::remove_connections(const std::vector<std::tuple<cell_gid_type, raw_cell_connection>>& conns) {
+    impl_->remove_connections(conns);
+}
+
+void simulation::commit_connections() { impl_->commit_connections(); }
 
 time_type simulation::run(const units::quantity& tfinal, const units::quantity& dt) {
     auto dt_ms = dt.value_as(units::ms);

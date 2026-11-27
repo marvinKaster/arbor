@@ -80,6 +80,14 @@ public:
         }
     }
 
+    template <typename C>
+    void add_connections(const std::vector<std::tuple<arb::cell_gid_type, C>>& conns) { sim_->add_connections(conns); }
+
+    template <typename C>
+    void remove_connections(const std::vector<std::tuple<arb::cell_gid_type, C>>& conns) { sim_->remove_connections(conns); }
+
+    void commit_connections() { sim_->commit_connections(); }
+
 
     std::string serialize() {
         arborio::json_serdes writer;
@@ -243,6 +251,32 @@ void register_simulation(py::module& m, pyarb_global_ptr global_ptr) {
              "Rebuild the connection table from recipe::connections_on and the event"
              "generators based on recipe::event_generators.",
              "recipe"_a)
+        .def("add_connections", &simulation_shim::add_connections<arb::cell_connection>,
+             py::call_guard<py::gil_scoped_release>(),
+             "Add connections, given as a list of (target gid, connection) tuples, without\n"
+             "rebuilding the connection table. Targets must be local to this rank.\n"
+             "Call commit_connections on all ranks before the next run.",
+             "connections"_a)
+        .def("add_connections", &simulation_shim::add_connections<arb::raw_cell_connection>,
+             py::call_guard<py::gil_scoped_release>(),
+             "Add raw connections, given as a list of (target gid, raw_connection) tuples.",
+             "connections"_a)
+        .def("remove_connections", &simulation_shim::remove_connections<arb::cell_connection>,
+             py::call_guard<py::gil_scoped_release>(),
+             "Remove one matching connection (equal source, target, weight, and delay) per\n"
+             "(target gid, connection) tuple. If a label refers to several items, a connection\n"
+             "on any of them matches, regardless of the selection policy. Nothing is removed\n"
+             "if any entry has no match.\n"
+             "Call commit_connections on all ranks before the next run.",
+             "connections"_a)
+        .def("remove_connections", &simulation_shim::remove_connections<arb::raw_cell_connection>,
+             py::call_guard<py::gil_scoped_release>(),
+             "Remove raw connections, given as a list of (target gid, raw_connection) tuples.",
+             "connections"_a)
+        .def("commit_connections", &simulation_shim::commit_connections,
+             py::call_guard<py::gil_scoped_release>(),
+             "Collective: apply added and removed connections to the spike exchange and\n"
+             "update the minimum network delay.")
         .def("deserialize", &simulation_shim::deserialize,
              py::call_guard<py::gil_scoped_release>(),
              "Deserialize the simulation object from a JSON string."

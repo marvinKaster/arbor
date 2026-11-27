@@ -1,7 +1,10 @@
+#include <algorithm>
 #include <numeric>
 #include <utility>
 #include <vector>
 #include <limits>
+#include <optional>
+#include <tuple>
 #include <unordered_set>
 
 #include <arbor/assert.hpp>
@@ -9,12 +12,14 @@
 #include <arbor/domain_decomposition.hpp>
 #include <arbor/recipe.hpp>
 #include <arbor/spike.hpp>
+#include <arbor/util/hash_def.hpp>
 #include <include/arbor/arbexcept.hpp>
 
 #include "communication/gathered_vector.hpp"
 #include "connection.hpp"
 #include "distributed_context.hpp"
 #include "execution_context.hpp"
+#include "label_resolution.hpp"
 #include "network_impl.hpp"
 #include "profile/profiler_macro.hpp"
 #include "threading/threading.hpp"
@@ -151,10 +156,6 @@ void communicator::update_connections(const recipe& rec,
     //       in many, many allocations and we don't have the proper primitives.
     std::size_t n_con = 0;
     std::vector<std::vector<connection>> connections_by_src_domain(num_domains_);
-    std::vector<std::vector<cell_member_type>> gids_domains(num_domains_);
-    for (auto& v : gids_domains) {
-        v.reserve(gids.size());
-    }
     // helper for adding a connection
     auto push_connection = [&] (const auto& conn, cell_gid_type tgt_gid, cell_size_type tgt_iod) {
         auto src_gid = conn.source.gid;
@@ -183,7 +184,6 @@ void communicator::update_connections(const recipe& rec,
                 .delay=conn.delay,
                 .index_on_domain=tgt_iod
             });
-            gids_domains[src_dom].push_back(cell_member_type{src_gid, src_lid});
     };
 
     PE(local);
@@ -219,38 +219,9 @@ void communicator::update_connections(const recipe& rec,
         if (src_gid >= num_total_cells_) throw arb::bad_connection_source_gid(-1, src_gid, num_total_cells_);
         auto src_dom = dom_dec->gid_domain(src_gid);
         connections_by_src_domain[src_dom].push_back(conn);
-        gids_domains[src_dom].push_back(conn.source);
         ++n_con;
     }
     PL(generated);
-
-    PE(sort_unique);
-    arb::threading::parallel_for::apply(0, gids_domains.size(), ctx_->thread_pool.get(),
-                                        [&](int i) {
-                                          auto& domain_gids = gids_domains[i];
-                                          ska_sort(domain_gids.begin(), domain_gids.end(),
-                                                   [](const cell_member_type& c) { return std::make_tuple(c.gid, c.index); });
-                                          domain_gids.erase(
-                                              std::unique(domain_gids.begin(), domain_gids.end()),
-                                              domain_gids.end()
-                                          );
-                                        });
-    PL(sort_unique);
-
-    PE(gids);
-    src_ranks_.clear();
-    auto srcs_by_rank = ctx_->distributed->all_to_all_gids_domains(gids_domains);
-    const auto& part = srcs_by_rank.partition();
-    const auto& srcs = srcs_by_rank.values();
-    for (auto domain: util::make_span(0, num_domains_)) {
-      auto beg = part[domain];
-      auto end = part[domain + 1];
-      for (auto idx: util::make_span(beg, end)) {
-        const auto& src = srcs[idx];
-        src_ranks_[src].push_back(domain);
-      }
-    }
-    PL(gids);
 
     // Sort the connections for each domain; num_domains_ independent sorts
     // parallelized trivially.
@@ -269,7 +240,342 @@ void communicator::update_connections(const recipe& rec,
     connections_.reserve(n_con);
     connections_.make(connections_by_src_domain);
     PL(destructure);
+
+    // The connections of each source domain are sorted by source, so the
+    // sources we need from each domain can be read off the table.
+    update_source_ranks();
     PL(update_conns);
+}
+
+void communicator::update_source_ranks() {
+    PE(gids);
+    std::vector<std::vector<cell_member_type>> gids_domains(num_domains_);
+    threading::parallel_for::apply(0, num_domains_, ctx_->thread_pool.get(),
+                                   [&](auto domain) {
+                                       auto& domain_gids = gids_domains[domain];
+                                       for (auto ix: util::make_span(connection_part_[domain], connection_part_[domain + 1])) {
+                                           const auto& src = connections_.srcs[ix];
+                                           if (domain_gids.empty() || domain_gids.back() != src) domain_gids.push_back(src);
+                                       }
+                                   });
+
+    src_ranks_.clear();
+    auto srcs_by_rank = ctx_->distributed->all_to_all_gids_domains(gids_domains);
+    const auto& part = srcs_by_rank.partition();
+    const auto& srcs = srcs_by_rank.values();
+    for (auto domain: util::make_span(0, num_domains_)) {
+        for (auto idx: util::make_span(part[domain], part[domain + 1])) {
+            src_ranks_[srcs[idx]].push_back(domain);
+        }
+    }
+    uncommitted_ = false;
+    PL(gids);
+}
+
+namespace {
+// Connection changes must target a cell of this domain and name an existing source cell.
+void check_gids(cell_gid_type tgt_gid, cell_gid_type src_gid, cell_size_type num_total_cells, const domain_decomposition_ptr& dom_dec) {
+    const auto domain = dom_dec->domain_id();
+    if (tgt_gid >= num_total_cells || dom_dec->gid_domain(tgt_gid) != domain) {
+        throw arb::bad_connection_target_gid(tgt_gid, domain);
+    }
+    if (src_gid >= num_total_cells) throw arb::bad_connection_source_gid(tgt_gid, src_gid, num_total_cells);
+}
+
+// All lids a label refers to on a cell, regardless of the selection policy.
+range_set lids_of(const label_resolution_map& map, cell_gid_type gid, const cell_tag_type& tag) {
+    auto key = gid_label_pair{.gid=gid, .label=hash_value(tag)};
+    if (auto it = map.singletons.find(key); it != map.singletons.end()) {
+        return range_set{.size=1, .ranges={{it->second, it->second + 1}}};
+    }
+    if (auto it = map.rangesets.find(key); it != map.rangesets.end()) return it->second;
+    throw arb::bad_connection_label(gid, tag, "label does not exist");
+}
+
+bool contains(const range_set& lids, cell_lid_type lid) {
+    for (const auto& r: lids.ranges) {
+        if (r.begin <= lid && lid < r.end) return true;
+    }
+    return false;
+}
+} // namespace
+
+template <typename C, typename F>
+void communicator::for_each_resolved(const std::vector<std::tuple<cell_gid_type, C>>& conns,
+                                     const domain_decomposition_ptr dom_dec,
+                                     const label_resolution_map* source_resolution_map,
+                                     const label_resolution_map& target_resolution_map,
+                                     F&& f) const {
+    // Mirror update_connections: target state is shared, source state is
+    // reset for each target cell.
+    auto target_resolver = resolver(&target_resolution_map);
+    auto source_resolver = resolver(source_resolution_map);
+    std::optional<cell_gid_type> last_tgt;
+    for (const auto& [tgt_gid, conn]: conns) {
+        auto src_gid = conn.source.gid;
+        check_gids(tgt_gid, src_gid, num_total_cells_, dom_dec);
+        if (last_tgt != tgt_gid) {
+            source_resolver.clear();
+            last_tgt = tgt_gid;
+        }
+        cell_lid_type src_lid;
+        if constexpr (std::is_same_v<cell_connection, C>) {
+            src_lid = source_resolver.resolve(conn.source);
+        }
+        else if constexpr (std::is_same_v<raw_cell_connection, C>) {
+            src_lid = conn.source.index;
+        }
+        else {
+            ARB_UNREACHABLE;
+        }
+        auto tgt_lid = target_resolver.resolve(tgt_gid, conn.target);
+        f(tgt_gid,
+          dom_dec->gid_domain(src_gid),
+          connection{
+              .source={.gid=src_gid, .index=src_lid},
+              .target=tgt_lid,
+              .weight=conn.weight,
+              .delay=conn.delay,
+              .index_on_domain=dom_dec->index_on_domain(tgt_gid)});
+    }
+}
+
+template <typename C>
+void communicator::add_connections_impl(const std::vector<std::tuple<cell_gid_type, C>>& conns,
+                                        const domain_decomposition_ptr dom_dec,
+                                        const label_resolution_map* source_resolution_map,
+                                        const label_resolution_map& target_resolution_map) {
+    PE(add_conns);
+    // Resolve everything before touching the table, so errors leave it intact.
+    std::vector<std::vector<connection>> added(num_domains_);
+    for_each_resolved(conns, dom_dec, source_resolution_map, target_resolution_map,
+                      [&](cell_gid_type, int src_dom, const connection& con) { added[src_dom].push_back(con); });
+    if (conns.empty()) {
+        PL(add_conns);
+        return;
+    }
+    for (auto& cons: added) std::stable_sort(cons.begin(), cons.end());
+
+    // Merge the new connections into the range of their source domain,
+    // keeping each range sorted by source.
+    connection_list merged;
+    merged.reserve(connections_.size() + conns.size());
+    std::vector<cell_size_type> part{0};
+    part.reserve(num_domains_ + 1);
+    for (auto domain: util::make_span(0, num_domains_)) {
+        auto ix = connection_part_[domain];
+        const auto end = connection_part_[domain + 1];
+        const auto& new_cons = added[domain];
+        auto jx = 0ul;
+        while (ix < end || jx < new_cons.size()) {
+            if (jx == new_cons.size() || (ix < end && connections_.srcs[ix] <= new_cons[jx].source)) {
+                merged.push_back(connections_.at(ix++));
+            }
+            else {
+                merged.push_back(new_cons[jx++]);
+            }
+        }
+        part.push_back(merged.size());
+    }
+    connections_ = std::move(merged);
+    connection_part_ = std::move(part);
+    uncommitted_ = true;
+    PL(add_conns);
+}
+
+template <typename C>
+void communicator::remove_connections_impl(const std::vector<std::tuple<cell_gid_type, C>>& conns,
+                                           const domain_decomposition_ptr dom_dec,
+                                           const label_resolution_map* source_resolution_map,
+                                           const label_resolution_map& target_resolution_map) {
+    PE(remove_conns);
+    // A removal matches any connection with the same source and target cells,
+    // weight, and delay whose lids are among those the labels refer to; the
+    // selection policy plays no role. If both labels refer to a single lid,
+    // the removal is exact; otherwise it may match on any of several lids.
+    // Both kinds are binned by source domain.
+    struct any_lid_removal {
+        connection con; // lids are those of the first match candidate
+        range_set src_lids;
+        range_set tgt_lids;
+        cell_gid_type tgt_gid;
+    };
+    std::vector<std::vector<std::pair<connection, cell_gid_type>>> removed(num_domains_);
+    std::vector<std::vector<any_lid_removal>> any_lid(num_domains_);
+    for (const auto& [tgt_gid, conn]: conns) {
+        auto src_gid = conn.source.gid;
+        check_gids(tgt_gid, src_gid, num_total_cells_, dom_dec);
+        range_set src_lids;
+        if constexpr (std::is_same_v<cell_connection, C>) {
+            src_lids = lids_of(*source_resolution_map, src_gid, conn.source.label.tag);
+        }
+        else if constexpr (std::is_same_v<raw_cell_connection, C>) {
+            src_lids = range_set{.size=1, .ranges={{conn.source.index, conn.source.index + 1}}};
+        }
+        else {
+            ARB_UNREACHABLE;
+        }
+        auto tgt_lids = lids_of(target_resolution_map, tgt_gid, conn.target.tag);
+        auto con = connection{.source={.gid=src_gid, .index=src_lids.at(0)},
+                              .target=tgt_lids.at(0),
+                              .weight=conn.weight,
+                              .delay=conn.delay,
+                              .index_on_domain=dom_dec->index_on_domain(tgt_gid)};
+        auto src_dom = dom_dec->gid_domain(src_gid);
+        if (src_lids.size == 1 && tgt_lids.size == 1) {
+            removed[src_dom].emplace_back(con, tgt_gid);
+        }
+        else {
+            any_lid[src_dom].push_back({con, std::move(src_lids), std::move(tgt_lids), tgt_gid});
+        }
+    }
+    if (conns.empty()) {
+        PL(remove_conns);
+        return;
+    }
+
+    // Mark first and compact afterwards, so errors leave the table intact.
+    std::vector<char> erase(connections_.size(), 0);
+    const auto& cs = connections_;
+    // Within a source, connections are identified by target, weight, and delay.
+    auto key_of = [&](std::size_t ix) { return std::make_tuple(cs.idx_on_domain[ix], cs.dests[ix], cs.weights[ix], cs.delays[ix]); };
+    auto key = [](const connection& con) { return std::make_tuple(con.index_on_domain, con.target, con.weight, con.delay); };
+    using key_type = decltype(key_of(0));
+    std::vector<key_type> keys;
+    std::vector<std::size_t> next;
+    for (auto domain: util::make_span(0, num_domains_)) {
+        auto& rem = removed[domain];
+        std::sort(rem.begin(), rem.end(),
+                  [&](const auto& l, const auto& r) { return std::make_tuple(l.first.source, key(l.first)) < std::make_tuple(r.first.source, key(r.first)); });
+        std::size_t run = connection_part_[domain];
+        const std::size_t end = connection_part_[domain + 1];
+        for (std::size_t r = 0; r < rem.size();) {
+            const auto source = rem[r].first.source;
+            auto r_end = r;
+            while (r_end < rem.size() && rem[r_end].first.source == source) ++r_end;
+            // The run of connections from this source is [run, run_end).
+            while (run < end && cs.srcs[run] < source) ++run;
+            auto run_end = run;
+            while (run_end < end && cs.srcs[run_end] == source) ++run_end;
+
+            // One sweep over the run, looking up each connection among this
+            // source's removals, which are sorted by key. Equal keys form a
+            // group; next[g] is the next unmatched removal of the group at g.
+            keys.clear();
+            for (auto i = r; i < r_end; ++i) keys.push_back(key(rem[i].first));
+            next.resize(keys.size());
+            std::iota(next.begin(), next.end(), 0);
+            for (auto ix = run; ix < run_end; ++ix) {
+                const auto k = key_of(ix);
+                auto lo = std::lower_bound(keys.begin(), keys.end(), k);
+                if (lo == keys.end() || *lo != k) continue;
+                auto g = lo - keys.begin();
+                if (next[g] < keys.size() && keys[next[g]] == k) {
+                    erase[ix] = 1;
+                    ++next[g];
+                }
+            }
+            // Every removal must have been matched.
+            for (std::size_t g = 0; g < keys.size();) {
+                auto g_end = g;
+                while (g_end < keys.size() && keys[g_end] == keys[g]) ++g_end;
+                if (next[g] < g_end) throw arb::missing_connection(rem[r + next[g]].second, source);
+                g = g_end;
+            }
+            r = r_end;
+            run = run_end;
+        }
+    }
+
+    // Removals that may match on several lids; each takes the first remaining
+    // match. This only fails if there are fewer matches than removals:
+    // - Matching the exact removals first can't take a match away, as an exact
+    //   removal only takes a copy of the connection it names, and copies are
+    //   interchangeable.
+    // - Every lid belongs to exactly one label, so two removals have either
+    //   the same candidates or none in common.
+    std::vector<std::vector<std::size_t>> candidates;
+    auto cell_key = [](const connection& con) { return std::make_tuple(con.index_on_domain, con.weight, con.delay); };
+    for (auto domain: util::make_span(0, num_domains_)) {
+        auto& rem = any_lid[domain];
+        std::sort(rem.begin(), rem.end(),
+                  [&](const auto& l, const auto& r) { return std::make_tuple(l.con.source.gid, cell_key(l.con)) < std::make_tuple(r.con.source.gid, cell_key(r.con)); });
+        const auto beg = cs.srcs.begin() + connection_part_[domain];
+        const auto end = cs.srcs.begin() + connection_part_[domain + 1];
+        for (std::size_t r = 0; r < rem.size();) {
+            const auto src_gid = rem[r].con.source.gid;
+            auto r_end = r;
+            while (r_end < rem.size() && rem[r_end].con.source.gid == src_gid) ++r_end;
+            std::vector<decltype(cell_key(rem[r].con))> cell_keys;
+            for (auto i = r; i < r_end; ++i) cell_keys.push_back(cell_key(rem[i].con));
+            // Collect the candidates among the connections from this source cell.
+            candidates.assign(r_end - r, {});
+            auto lo = std::partition_point(beg, end, [&](const auto& s) { return s.gid < src_gid; }) - cs.srcs.begin();
+            auto hi = std::partition_point(beg, end, [&](const auto& s) { return s.gid <= src_gid; }) - cs.srcs.begin();
+            for (auto ix: util::make_span(lo, hi)) {
+                if (erase[ix]) continue;
+                auto [first, last] = std::equal_range(cell_keys.begin(), cell_keys.end(),
+                                                      std::make_tuple(cs.idx_on_domain[ix], cs.weights[ix], cs.delays[ix]));
+                for (auto i = first - cell_keys.begin(); i < last - cell_keys.begin(); ++i) {
+                    const auto& q = rem[r + i];
+                    if (contains(q.src_lids, cs.srcs[ix].index) && contains(q.tgt_lids, cs.dests[ix])) candidates[i].push_back(ix);
+                }
+            }
+            for (std::size_t i = 0; i < candidates.size(); ++i) {
+                auto match = std::find_if(candidates[i].begin(), candidates[i].end(), [&](auto ix) { return !erase[ix]; });
+                if (match == candidates[i].end()) throw arb::missing_connection(rem[r + i].tgt_gid, rem[r + i].con.source);
+                erase[*match] = 1;
+            }
+            r = r_end;
+        }
+    }
+
+    connection_list kept;
+    kept.reserve(connections_.size() - conns.size());
+    std::vector<cell_size_type> part{0};
+    part.reserve(num_domains_ + 1);
+    for (auto domain: util::make_span(0, num_domains_)) {
+        for (auto ix: util::make_span(connection_part_[domain], connection_part_[domain + 1])) {
+            if (!erase[ix]) kept.push_back(connections_.at(ix));
+        }
+        part.push_back(kept.size());
+    }
+    connections_ = std::move(kept);
+    connection_part_ = std::move(part);
+    uncommitted_ = true;
+    PL(remove_conns);
+}
+
+void communicator::add_connections(const std::vector<std::tuple<cell_gid_type, cell_connection>>& conns,
+                                   const domain_decomposition_ptr dom_dec,
+                                   const label_resolution_map& source_resolution_map,
+                                   const label_resolution_map& target_resolution_map) {
+    add_connections_impl(conns, dom_dec, &source_resolution_map, target_resolution_map);
+}
+
+void communicator::add_connections(const std::vector<std::tuple<cell_gid_type, raw_cell_connection>>& conns,
+                                   const domain_decomposition_ptr dom_dec,
+                                   const label_resolution_map& target_resolution_map) {
+    add_connections_impl(conns, dom_dec, nullptr, target_resolution_map);
+}
+
+void communicator::remove_connections(const std::vector<std::tuple<cell_gid_type, cell_connection>>& conns,
+                                      const domain_decomposition_ptr dom_dec,
+                                      const label_resolution_map& source_resolution_map,
+                                      const label_resolution_map& target_resolution_map) {
+    remove_connections_impl(conns, dom_dec, &source_resolution_map, target_resolution_map);
+}
+
+void communicator::remove_connections(const std::vector<std::tuple<cell_gid_type, raw_cell_connection>>& conns,
+                                      const domain_decomposition_ptr dom_dec,
+                                      const label_resolution_map& target_resolution_map) {
+    remove_connections_impl(conns, dom_dec, nullptr, target_resolution_map);
+}
+
+void communicator::commit_connections() {
+    PE(commit_conns);
+    update_source_ranks();
+    PL(commit_conns);
 }
 
 std::pair<cell_size_type, cell_size_type> communicator::group_queue_range(cell_size_type i) {

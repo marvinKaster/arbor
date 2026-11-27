@@ -101,6 +101,46 @@ Class documentation
 
     **Updating Model State:**
 
+    .. cpp:function:: void update(const recipe& rec)
+
+        Rebuild the connection table and event generators from the recipe. This
+        discards changes made with :cpp:func:`add_connections` and
+        :cpp:func:`remove_connections`.
+
+    .. cpp:function:: void add_connections(const std::vector<std::tuple<cell_gid_type, cell_connection>>& conns)
+                      void add_connections(const std::vector<std::tuple<cell_gid_type, raw_cell_connection>>& conns)
+
+        Add connections without rebuilding the connection table, e.g. to model
+        structural plasticity. Each entry is a target gid, which must be local
+        to the calling rank, and a connection terminating on it. Labels are
+        resolved like the recipe's connections, but the state of the
+        ``round_robin`` policies starts afresh with each call. If any entry is
+        invalid, an exception is thrown and no connection is added.
+
+        This only changes the local connection table and may be called a
+        different number of times on each rank. :cpp:func:`commit_connections`
+        must be called on all ranks before the next :cpp:func:`run`.
+
+    .. cpp:function:: void remove_connections(const std::vector<std::tuple<cell_gid_type, cell_connection>>& conns)
+                      void remove_connections(const std::vector<std::tuple<cell_gid_type, raw_cell_connection>>& conns)
+
+        Remove one connection per entry with equal source and target cells,
+        weight, and delay. If a label refers to several items, e.g. synapses
+        connected ``round_robin``, a connection on any of them matches, and the
+        selection policy plays no role; which of several matching connections
+        is removed is unspecified. To remove a particular one, give its items
+        labels of their own. If an entry has no match left,
+        :cpp:class:`missing_connection` is thrown and no connection is removed.
+        As for :cpp:func:`add_connections`, :cpp:func:`commit_connections` must
+        be called afterwards.
+
+    .. cpp:function:: void commit_connections()
+
+        Collective. Make added and removed connections known to the ranks that
+        own their sources and update the minimum network delay, and with it the
+        maximum time step. The changes take effect for spikes generated in the
+        next call to :cpp:func:`run`.
+
     .. cpp:function:: void reset()
 
         Reset the state of the simulation to its initial state.

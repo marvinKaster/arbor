@@ -54,6 +54,16 @@ bad_connection_source_gid::bad_connection_source_gid(cell_gid_type gid, cell_gid
     gid(gid), src_gid(src_gid), num_cells(num_cells)
 {}
 
+bad_connection_target_gid::bad_connection_target_gid(cell_gid_type gid, int domain):
+    arbor_exception(pprintf("Connection update error: target gid {} is not a cell on domain {}.", gid, domain)),
+    gid(gid), domain(domain)
+{}
+
+missing_connection::missing_connection(cell_gid_type gid, cell_member_type source):
+    arbor_exception(pprintf("Connection update error on cell {}: no matching connection from source {} left to remove.", gid, source)),
+    gid(gid), source(source)
+{}
+
 source_gid_exceeds_limit::source_gid_exceeds_limit(cell_gid_type gid, cell_gid_type src_gid):
     arbor_exception(pprintf("Model building error on cell {}: connection source gid {} is out of range: gids may not exceed {}.",
                             gid, src_gid, std::numeric_limits<cell_gid_type>::max()/2)),

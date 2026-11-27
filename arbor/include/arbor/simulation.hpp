@@ -3,6 +3,7 @@
 #include <memory>
 #include <vector>
 #include <functional>
+#include <tuple>
 #include <unordered_set>
 
 #include <arbor/export.hpp>
@@ -46,6 +47,29 @@ struct ARB_ARBOR_API simulation {
     static simulation_builder create(recipe const &);
 
     void update(const recipe& rec);
+
+    // Change the network without rebuilding it from a recipe. Each entry is
+    // a target gid local to the calling rank and a connection terminating on
+    // it. Labels are resolved like the connections of the recipe; resolution
+    // state (e.g. round_robin) starts afresh with each call.
+    //
+    // These calls only change the local connection table and may differ
+    // between ranks. Afterwards, commit_connections must be called on all ranks
+    // before the next call to run. update(recipe) discards all changes.
+    void add_connections(const std::vector<std::tuple<cell_gid_type, cell_connection>>& conns);
+    void add_connections(const std::vector<std::tuple<cell_gid_type, raw_cell_connection>>& conns);
+
+    // Remove one matching connection per entry; source and target cells,
+    // weight, and delay must be equal. If a label refers to several items,
+    // a connection on any of them matches, regardless of the selection
+    // policy. Throws arb::missing_connection, without removing anything, if
+    // an entry has no match.
+    void remove_connections(const std::vector<std::tuple<cell_gid_type, cell_connection>>& conns);
+    void remove_connections(const std::vector<std::tuple<cell_gid_type, raw_cell_connection>>& conns);
+
+    // Collective: apply the changes of add_connections and remove_connections
+    // to the spike exchange and update the minimum network delay.
+    void commit_connections();
 
     void reset();
 

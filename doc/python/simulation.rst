@@ -85,6 +85,32 @@ simulation is built using this :py:class:`~arbor.domain_decomposition`.
         in the return value of its :py:func:`~arbor.recipe.connections_on` when compared to
         the original recipe used to construct the simulation object.
 
+    .. function:: add_connections(connections)
+
+        Add connections without rebuilding the connection table, e.g. to model
+        structural plasticity. ``connections`` is a list of
+        ``(target gid, connection)`` or ``(target gid, raw_connection)`` tuples;
+        targets must be local to the calling rank. If any entry is invalid, an
+        exception is raised and no connection is added. Call
+        :py:func:`commit_connections` on all ranks before the next :py:func:`run`.
+
+    .. function:: remove_connections(connections)
+
+        Remove one connection per ``(target gid, connection)`` tuple with equal
+        source and target cells, weight, and delay. If a label refers to several
+        items, e.g. synapses connected ``round_robin``, a connection on any of
+        them matches, and the selection policy plays no role; which of several
+        matching connections is removed is unspecified. To remove a particular
+        one, give its items labels of their own. If an entry has no match left,
+        an exception is raised and no connection is removed. Call
+        :py:func:`commit_connections` on all ranks before the next :py:func:`run`.
+
+    .. function:: commit_connections()
+
+        Collective. Apply added and removed connections to the spike exchange
+        and update the minimum network delay. :py:func:`update_connections`
+        discards all such changes.
+
     .. function:: reset()
 
         Reset the state of the simulation to its initial state.

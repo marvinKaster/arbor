@@ -1,5 +1,6 @@
 #pragma once
 
+#include <tuple>
 #include <vector>
 
 #include <arbor/common_types.hpp>
@@ -87,6 +88,40 @@ public:
 
     void set_remote_spike_filter(const spike_predicate&);
 
+    // Incremental changes to the connection table, without rebuilding it from
+    // a recipe. Each entry is a target gid, which must be local to this rank,
+    // and a connection terminating on it. Either all entries of a call are
+    // applied or, if an exception is thrown, none of them.
+    //
+    // Additions and removals only change the local table. commit_connections
+    // must be called collectively afterwards, before spikes are exchanged
+    // again, to tell the source ranks where to send their spikes.
+    void add_connections(const std::vector<std::tuple<cell_gid_type, cell_connection>>& conns,
+                         const domain_decomposition_ptr dom_dec,
+                         const label_resolution_map& source_resolution_map,
+                         const label_resolution_map& target_resolution_map);
+    void add_connections(const std::vector<std::tuple<cell_gid_type, raw_cell_connection>>& conns,
+                         const domain_decomposition_ptr dom_dec,
+                         const label_resolution_map& target_resolution_map);
+
+    // Remove one matching connection per entry. A connection matches if source,
+    // target, weight, and delay are equal. Throws missing_connection if no
+    // match is left for an entry.
+    void remove_connections(const std::vector<std::tuple<cell_gid_type, cell_connection>>& conns,
+                            const domain_decomposition_ptr dom_dec,
+                            const label_resolution_map& source_resolution_map,
+                            const label_resolution_map& target_resolution_map);
+    void remove_connections(const std::vector<std::tuple<cell_gid_type, raw_cell_connection>>& conns,
+                            const domain_decomposition_ptr dom_dec,
+                            const label_resolution_map& target_resolution_map);
+
+    // Collective: make the changes of add_connections and remove_connections
+    // known to the ranks that own the sources.
+    void commit_connections();
+
+    // The local connection table was changed since the last commit.
+    bool has_uncommitted_connections() const { return uncommitted_; }
+
     // TODO: This is public for now.
     struct connection_list {
         std::vector<cell_size_type> idx_on_domain;
@@ -95,14 +130,20 @@ public:
         std::vector<float> weights;
         std::vector<float> delays;
 
+        void push_back(const connection& con) {
+            idx_on_domain.push_back(con.index_on_domain);
+            srcs.push_back(con.source);
+            dests.push_back(con.target);
+            weights.push_back(con.weight);
+            delays.push_back(con.delay);
+        }
+
+        connection at(std::size_t i) const {
+            return {.source=srcs[i], .target=dests[i], .weight=weights[i], .delay=delays[i], .index_on_domain=idx_on_domain[i]};
+        }
+
         void make(std::vector<connection>& cons) {
-            for (const auto& con: cons) {
-                idx_on_domain.push_back(con.index_on_domain);
-                srcs.push_back(con.source);
-                dests.push_back(con.target);
-                weights.push_back(con.weight);
-                delays.push_back(con.delay);
-            }
+            for (const auto& con: cons) push_back(con);
         }
 
         void make(std::vector<std::vector<connection>>& conss) {
@@ -136,6 +177,27 @@ public:
     const connection_list& connections() const;
 
 private:
+    // Resolve connections and call f(tgt_gid, src_domain, connection) on each.
+    template <typename C, typename F>
+    void for_each_resolved(const std::vector<std::tuple<cell_gid_type, C>>& conns,
+                           const domain_decomposition_ptr dom_dec,
+                           const label_resolution_map* source_resolution_map,
+                           const label_resolution_map& target_resolution_map,
+                           F&& f) const;
+    template <typename C>
+    void add_connections_impl(const std::vector<std::tuple<cell_gid_type, C>>& conns,
+                              const domain_decomposition_ptr dom_dec,
+                              const label_resolution_map* source_resolution_map,
+                              const label_resolution_map& target_resolution_map);
+    template <typename C>
+    void remove_connections_impl(const std::vector<std::tuple<cell_gid_type, C>>& conns,
+                                 const domain_decomposition_ptr dom_dec,
+                                 const label_resolution_map* source_resolution_map,
+                                 const label_resolution_map& target_resolution_map);
+
+    // Rebuild src_ranks_ from the connection table; collective.
+    void update_source_ranks();
+
     cell_size_type num_total_cells_ = 0;
     cell_size_type num_local_cells_ = 0;
     cell_size_type num_local_groups_ = 0;
@@ -159,6 +221,7 @@ private:
     std::uint64_t num_spikes_ = 0u;
     std::uint64_t num_local_spikes_ = 0u;
     std::uint64_t num_local_events_ = 0u;
+    bool uncommitted_ = false;
     context ctx_;
 };
 

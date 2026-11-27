@@ -10,7 +10,10 @@
 #include <arbor/event_generator.hpp>
 #include <arbor/load_balance.hpp>
 #include <arbor/lif_cell.hpp>
+#include <arbor/morph/primitives.hpp>
+#include <arbor/morph/segment_tree.hpp>
 #include <arbor/recipe.hpp>
+#include <arbor/schedule.hpp>
 #include <arbor/simulation.hpp>
 #include <arbor/spike_source_cell.hpp>
 
@@ -238,4 +241,181 @@ TEST(simulation, update_does_not_duplicate_connections) {
     sim.run(5*U::ms, 0.025*U::ms);
     ASSERT_EQ(1u, spikes.size());
     EXPECT_EQ(0u, spikes[0].source.gid);
+}
+
+namespace {
+using conn_list = std::vector<std::tuple<cell_gid_type, cell_connection>>;
+using raw_conn_list = std::vector<std::tuple<cell_gid_type, raw_cell_connection>>;
+
+// The connection of sub_threshold_pair; two of them make cell 1 fire.
+cell_connection sub_threshold_connection(float weight = 150.f, double delay = 1) {
+    return cell_connection({0, "src"}, {"tgt"}, weight, delay*U::ms);
+}
+
+// Run sub_threshold_pair for 5 ms and return the gids that fired.
+std::vector<cell_gid_type> fired(simulation& sim) {
+    std::vector<cell_gid_type> gids;
+    sim.set_local_spike_callback([&](const std::vector<spike>& s) { for (auto& spk: s) gids.push_back(spk.source.gid); });
+    sim.run(5*U::ms, 0.025*U::ms);
+    std::sort(gids.begin(), gids.end());
+    return gids;
+}
+} // namespace
+
+TEST(simulation, add_connections) {
+    auto rec = sub_threshold_pair();
+    auto sim = simulation(rec);
+    sim.add_connections(conn_list{{1, sub_threshold_connection()}});
+    sim.commit_connections();
+    EXPECT_EQ((std::vector<cell_gid_type>{0, 1}), fired(sim));
+}
+
+TEST(simulation, add_raw_connections) {
+    auto rec = sub_threshold_pair();
+    auto sim = simulation(rec);
+    sim.add_connections(raw_conn_list{{1, raw_cell_connection({0, 0}, {"tgt"}, 150.f, 1*U::ms)}});
+    sim.commit_connections();
+    EXPECT_EQ((std::vector<cell_gid_type>{0, 1}), fired(sim));
+}
+
+TEST(simulation, remove_connections) {
+    auto rec = sub_threshold_pair();
+    auto sim = simulation(rec);
+    // Removes one of the two identical connections again.
+    sim.add_connections(conn_list{{1, sub_threshold_connection()}});
+    sim.remove_connections(conn_list{{1, sub_threshold_connection()}});
+    sim.commit_connections();
+    EXPECT_EQ((std::vector<cell_gid_type>{0}), fired(sim));
+    EXPECT_EQ(1u, sim.num_spikes());
+}
+
+TEST(simulation, remove_connections_needs_exact_match) {
+    auto rec = sub_threshold_pair();
+    auto sim = simulation(rec);
+    // Weight, delay, or the number of copies differ: nothing must be removed.
+    EXPECT_THROW(sim.remove_connections(conn_list{{1, sub_threshold_connection(151.f)}}), missing_connection);
+    EXPECT_THROW(sim.remove_connections(conn_list{{1, sub_threshold_connection(150.f, 2)}}), missing_connection);
+    EXPECT_THROW(sim.remove_connections(conn_list{{1, sub_threshold_connection()},
+                                                  {1, sub_threshold_connection()}}), missing_connection);
+    sim.add_connections(conn_list{{1, sub_threshold_connection()}});
+    sim.commit_connections();
+    EXPECT_EQ((std::vector<cell_gid_type>{0, 1}), fired(sim));
+}
+
+TEST(simulation, remove_many_connections_from_one_source) {
+    // Enough removals from one source to match them by sorting.
+    auto rec = sub_threshold_pair();
+    auto sim = simulation(rec);
+    conn_list small, large;
+    for (int i = 0; i < 20; ++i) {
+        small.emplace_back(1, sub_threshold_connection(10.f));
+        large.emplace_back(1, sub_threshold_connection(12.f));
+    }
+    // 20*10 + 20*12 + 150 = 590 pA ms on 20 pF: 29.5 mV.
+    sim.add_connections(small);
+    sim.add_connections(large);
+
+    // One copy too many: nothing must be removed.
+    auto too_many = large;
+    too_many.emplace_back(1, sub_threshold_connection(12.f));
+    EXPECT_THROW(sim.remove_connections(too_many), missing_connection);
+
+    // Leaves 2*10 + 150 = 170 pA ms: 8.5 mV, below the threshold.
+    auto removed = large;
+    removed.insert(removed.end(), small.begin() + 2, small.end());
+    sim.remove_connections(removed);
+    sim.commit_connections();
+    EXPECT_EQ((std::vector<cell_gid_type>{0}), fired(sim));
+}
+
+namespace {
+// Cell 1 has three synapses under the label "syn"; the recipe connects cell 0
+// to them round robin, with weights 1, 2, and 3 on synapses 0, 1, and 2.
+struct multi_synapse_pair: public recipe {
+    multi_synapse_pair() { properties.default_parameters = neuron_parameter_defaults; }
+    cell_size_type num_cells() const override { return 2; }
+    cell_kind get_cell_kind(cell_gid_type gid) const override { return gid ? cell_kind::cable : cell_kind::spike_source; }
+    util::unique_any get_cell_description(cell_gid_type gid) const override {
+        if (gid == 0) return spike_source_cell("src", explicit_schedule_from_milliseconds(std::vector<double>{}));
+        segment_tree tree;
+        tree.append(mnpos, {0, 0, 0, 10}, {0, 0, 20, 10}, 1);
+        decor dec;
+        for (auto pos: {0.1, 0.5, 0.9}) dec.place(mlocation{0, pos}, synapse("expsyn"), "syn");
+        return cable_cell(tree, dec);
+    }
+    std::vector<cell_connection> connections_on(cell_gid_type gid) const override {
+        if (gid != 1) return {};
+        return {syn_connection(1.f), syn_connection(2.f), syn_connection(3.f)};
+    }
+    std::any get_global_properties(cell_kind) const override { return properties; }
+
+    static cell_connection syn_connection(float weight, lid_selection_policy policy = lid_selection_policy::round_robin) {
+        return cell_connection({0, "src"}, {"syn", policy}, weight, 1*U::ms);
+    }
+
+    cable_cell_global_properties properties;
+};
+} // namespace
+
+TEST(simulation, remove_connections_on_any_lid_of_label) {
+    auto rec = multi_synapse_pair();
+    auto sim = simulation(rec);
+    auto conn = [](float weight, lid_selection_policy policy = lid_selection_policy::round_robin) {
+        return conn_list{{1, multi_synapse_pair::syn_connection(weight, policy)}};
+    };
+    // The connection with weight 2 is on synapse 1, while resolving "syn" round
+    // robin afresh gives synapse 0. It is found anyway, but only once.
+    sim.remove_connections(conn(2.f));
+    EXPECT_THROW(sim.remove_connections(conn(2.f)), missing_connection);
+    // The selection policy plays no role in removal.
+    sim.remove_connections(conn(3.f, lid_selection_policy::assert_univalent));
+
+    // Now there are three connections with weight 1, on synapses 0, 0, and 1.
+    sim.add_connections(conn_list{{1, multi_synapse_pair::syn_connection(1.f)}, {1, multi_synapse_pair::syn_connection(1.f)}});
+    auto ones = [&](int n) { return conn_list(n, conn(1.f).front()); };
+    // One too many: nothing must be removed.
+    EXPECT_THROW(sim.remove_connections(ones(4)), missing_connection);
+    sim.remove_connections(ones(3));
+    EXPECT_THROW(sim.remove_connections(ones(1)), missing_connection);
+    sim.commit_connections();
+    sim.run(1*U::ms, 0.025*U::ms);
+}
+
+TEST(simulation, connection_changes_check_gids) {
+    auto rec = sub_threshold_pair();
+    auto sim = simulation(rec);
+    EXPECT_THROW(sim.add_connections(conn_list{{2, sub_threshold_connection()}}), bad_connection_target_gid);
+    EXPECT_THROW(sim.add_connections(conn_list{{1, cell_connection({2, "src"}, {"tgt"}, 1.f, 1*U::ms)}}), bad_connection_source_gid);
+    EXPECT_THROW(sim.add_connections(conn_list{{1, cell_connection({0, "nope"}, {"tgt"}, 1.f, 1*U::ms)}}), bad_connection_label);
+    // Failed calls must not leave changes behind.
+    EXPECT_EQ((std::vector<cell_gid_type>{0}), fired(sim));
+}
+
+TEST(simulation, run_requires_commit) {
+    auto rec = sub_threshold_pair();
+    auto sim = simulation(rec);
+    sim.add_connections(conn_list{{1, sub_threshold_connection()}});
+    EXPECT_THROW(sim.run(5*U::ms, 0.025*U::ms), arbor_exception);
+    sim.commit_connections();
+    EXPECT_EQ((std::vector<cell_gid_type>{0, 1}), fired(sim));
+}
+
+TEST(simulation, commit_updates_min_delay) {
+    auto rec = sub_threshold_pair();
+    auto sim = simulation(rec);
+    EXPECT_FLOAT_EQ(1.0, sim.min_delay());
+    sim.add_connections(conn_list{{1, sub_threshold_connection(150.f, 0.5)}});
+    sim.commit_connections();
+    EXPECT_FLOAT_EQ(0.5, sim.min_delay());
+    sim.remove_connections(conn_list{{1, sub_threshold_connection(150.f, 0.5)}});
+    sim.commit_connections();
+    EXPECT_FLOAT_EQ(1.0, sim.min_delay());
+}
+
+TEST(simulation, update_discards_connection_changes) {
+    auto rec = sub_threshold_pair();
+    auto sim = simulation(rec);
+    sim.add_connections(conn_list{{1, sub_threshold_connection()}});
+    sim.update(rec);
+    EXPECT_EQ((std::vector<cell_gid_type>{0}), fired(sim));
 }
